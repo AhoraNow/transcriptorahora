@@ -135,10 +135,10 @@ export function toWordHtml(turns: Turn[], names: Record<string, string>, title: 
 
 function escapeHtml(value: string): string {
   return value.replace(/[&<>"]/g, (ch) => {
-    if (ch === "&") return "\\u0026amp;";
-    if (ch === "<") return "\\u0026lt;";
-    if (ch === ">") return "\\u0026gt;";
-    return "\\u0026quot;";
+    if (ch === "&") return "\u0026amp;";
+    if (ch === "<") return "\u0026lt;";
+    if (ch === ">") return "\u0026gt;";
+    return "\u0026quot;";
   });
 }
 
