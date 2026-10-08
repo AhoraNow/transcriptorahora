@@ -40,21 +40,17 @@ export const authMiddleware = createMiddleware({ type: "function" })
     // it, and so Vite does not ship `@tanstack/react-start/server` to the browser.
     const { assertSameSiteRequest } = await import("./isolation.server");
     const { requireUserId, getSessionUser } = await import("./verify.server");
-    const { gateIdentityFromHeaders } = await import("./gate-identity.server");
     const { assertOnTeam } = await import("../team-access.server");
-    const { getRequest } = await import("@tanstack/react-start/server");
     const { isWorkspacePreview } = await import("../env.server");
     assertSameSiteRequest();
     const userId = await requireUserId(context.bearerToken);
     const user = await getSessionUser(context.bearerToken);
-    const request = getRequest();
-    const identity = request ? await gateIdentityFromHeaders(request.headers) : null;
-    const gateOwner = Boolean(identity) || (isWorkspacePreview() && Boolean(user));
-    if (!gateOwner) {
-      if (!user?.email) throw new Error("Esta cuenta no está autorizada.");
-      await assertOnTeam(user.email);
-    }
+    const { accessFor } = await import("../team");
+    const email = user?.email ?? null;
+    const access = accessFor({ preview: isWorkspacePreview(), signedIn: Boolean(user), email });
+    if (access === "denied") throw new Error("Esta cuenta no está autorizada.");
+    if (access === "check-team") await assertOnTeam(email);
     return next({
-      context: { userId, email: user?.email ?? "", gateOwner },
+      context: { userId, email: email ?? "", owner: access === "owner" },
     });
   });
