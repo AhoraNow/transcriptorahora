@@ -2,7 +2,7 @@ import { createServerFn } from "@tanstack/react-start";
 import { getSql, rememberScribeKey } from "@/lib/db";
 import { authMiddleware } from "@/lib/auth/middleware";
 import type { Cue } from "@/lib/transcript";
-import { toCues } from "@/lib/transcript";
+import { isOwnerEmail } from "@/lib/team";
 
 type CueRow = Cue;
 
@@ -24,6 +24,9 @@ export const saveKey = createServerFn({ method: "POST" })
     return trimmed;
   })
   .handler(async ({ context, data: key }) => {
+    if (!context.gateOwner && !isOwnerEmail(context.email)) {
+      throw new Error("Solo la cuenta del diario puede cambiar la clave.");
+    }
     const sql = await getSql();
     await sql`
       insert into scribe_secret (id, api_key, updated_by)
@@ -33,86 +36,11 @@ export const saveKey = createServerFn({ method: "POST" })
             updated_by = excluded.updated_by,
             updated_at = now()
     `;
-    await rememberScribeKey(key);
+    // La copia en disco solo existe en la vista previa de Grok. En Vercel no hay
+    // carpeta donde escribir, y la clave ya quedó guardada en la base.
+    const { isWorkspacePreview } = await import("@/lib/env.server");
+    if (isWorkspacePreview()) await rememberScribeKey(key).catch(() => undefined);
     return { configured: true };
-  });
-
-export const transcribeOnServer = createServerFn({ method: "POST" })
-  .middleware([authMiddleware])
-  .validator((data: FormData) => {
-    const file = data.get("file");
-    if (!(file instanceof Blob) || file.size < 1000) {
-      throw new Error("El archivo no llegó o está vacío.");
-    }
-    if (file.size > 250 * 1024 * 1024) {
-      throw new Error("El archivo pasa de 250 MB. Bájalo de peso o recórtalo.");
-    }
-    const speakers = Number(data.get("speakers") || 0);
-    const keyterms = String(data.get("keyterms") || "");
-    const name = file instanceof File && file.name ? file.name : "audio.mp3";
-    return { file, speakers: Number.isFinite(speakers) ? speakers : 0, keyterms, name };
-  })
-  .handler(async ({ data }) => {
-    const sql = await getSql();
-    const rows = await sql<{ api_key: string }>`select api_key from scribe_secret where id = 1`;
-    const apiKey = rows[0]?.api_key?.trim();
-    if (!apiKey) throw new Error("Todavía no hay una clave de ElevenLabs configurada.");
-
-    const send = async (withTerms: boolean) => {
-      const body = new FormData();
-      body.append("model_id", "scribe_v2");
-      body.append("file", data.file, data.name);
-      body.append("language_code", "es");
-      body.append("diarize", "true");
-      body.append("timestamps_granularity", "word");
-      body.append("tag_audio_events", "false");
-      if (data.speakers > 0 && data.speakers <= 32) {
-        body.append("num_speakers", String(Math.round(data.speakers)));
-      }
-      if (withTerms) {
-        for (const term of data.keyterms.split(/[\n,;]+/)) {
-          const clean = term.trim();
-          if (clean.length >= 2 && clean.length < 50) body.append("keyterms", clean);
-        }
-      }
-      return fetch("https://api.elevenlabs.io/v1/speech-to-text", {
-        method: "POST",
-        headers: { "xi-api-key": apiKey },
-        body,
-      });
-    };
-
-    let response = await send(true);
-    if ((response.status === 400 || response.status === 422) && data.keyterms.trim()) {
-      response = await send(false);
-    }
-    if (!response.ok) {
-      const detail = (await response.text()).replace(/\s+/g, " ").slice(0, 220);
-      if (response.status === 401) {
-        throw new Error("ElevenLabs rechazó la clave. Toca Reemplazar y pega una clave nueva.");
-      }
-      throw new Error(`ElevenLabs no transcribió (${response.status}). ${detail}`);
-    }
-    const payload = (await response.json()) as {
-      text?: string;
-      words?: Array<{
-        text?: string;
-        word?: string;
-        start?: number;
-        end?: number;
-        type?: string;
-        speaker_id?: string;
-        speaker?: string;
-      }>;
-    };
-    const cues = toCues(payload.words);
-    if (cues.length === 0 && payload.text?.trim()) {
-      return { cues: [{ speaker: "speaker_0", start: 0, end: 0, text: payload.text.trim() }] };
-    }
-    if (cues.length === 0) {
-      throw new Error("ElevenLabs no devolvió texto. Revisa que el archivo tenga voz.");
-    }
-    return { cues };
   });
 
 export const mintScribeToken = createServerFn({ method: "POST" })
@@ -127,11 +55,17 @@ export const mintScribeToken = createServerFn({ method: "POST" })
       headers: { "xi-api-key": apiKey },
     });
     if (!response.ok) {
-      const detail = (await response.text()).slice(0, 180);
-      if (response.status === 401) {
+      const detail = await response.text();
+      // ElevenLabs responde 400 (no 401) cuando la clave tiene un formato inválido.
+      if (response.status === 401 || response.status === 403 || /invalid_api_key/.test(detail)) {
         throw new Error("ElevenLabs rechazó la clave guardada. Hay que reemplazarla.");
       }
-      throw new Error(`No se pudo preparar la transcripción. ${detail}`);
+      if (response.status === 429) {
+        throw new Error("ElevenLabs está limitando las peticiones. Espera un minuto y reintenta.");
+      }
+      throw new Error(
+        `ElevenLabs no respondió bien (${response.status}). Intenta de nuevo en un momento.`,
+      );
     }
     const payload = (await response.json()) as { token?: string };
     if (!payload.token) throw new Error("ElevenLabs no entregó un pase de un solo uso.");
@@ -222,6 +156,35 @@ export const saveTranscript = createServerFn({ method: "POST" })
       )
     `;
     return { id };
+  });
+
+export const updateTranscriptCues = createServerFn({ method: "POST" })
+  .middleware([authMiddleware])
+  .validator((input: { id: string; cues: Cue[] }) => {
+    if (!input || !Array.isArray(input.cues) || input.cues.length === 0) {
+      throw new Error("No hay texto para guardar.");
+    }
+    if (input.cues.length > 30000) throw new Error("La transcripción es demasiado larga.");
+    return {
+      id: String(input.id || "").trim(),
+      // Una frase corregida reúne varias palabras: el límite es por turno, no por palabra.
+      cues: input.cues.map((cue) => ({
+        speaker: String(cue.speaker || "speaker_0").slice(0, 40),
+        start: Number(cue.start) || 0,
+        end: Number(cue.end) || 0,
+        text: String(cue.text || "").slice(0, 20000),
+      })),
+    };
+  })
+  .handler(async ({ context, data }) => {
+    if (!data.id) return { ok: false };
+    const sql = await getSql();
+    await sql`
+      update transcripts
+      set words_json = ${JSON.stringify(data.cues)}
+      where id = ${data.id} and user_id = ${context.userId}
+    `;
+    return { ok: true };
   });
 
 export const renameSpeakers = createServerFn({ method: "POST" })

@@ -10,6 +10,7 @@ import {
   mintScribeToken,
   renameSpeakers,
   saveKey,
+  updateTranscriptCues,
   saveTranscript,
 } from "@/lib/scribe-fns";
 import { teamAccess } from "@/lib/team-fns";
@@ -64,21 +65,41 @@ function lastStartedAt(items: { start: number }[], seconds: number): number {
   return found;
 }
 
-function rememberTranscript(title: string, cues: Cue[], names: Record<string, string>) {
+function rememberTranscript(
+  title: string,
+  cues: Cue[],
+  names: Record<string, string>,
+  id: string | null,
+) {
   try {
-    localStorage.setItem(LAST_KEY, JSON.stringify({ title, cues, names }));
+    localStorage.setItem(LAST_KEY, JSON.stringify({ title, cues, names, id }));
   } catch {
     // Si el navegador no puede guardar, el texto igual queda en pantalla.
   }
 }
 
-function recallTranscript(): { title: string; cues: Cue[]; names: Record<string, string> } | null {
+function recallTranscript(): {
+  title: string;
+  cues: Cue[];
+  names: Record<string, string>;
+  id: string | null;
+} | null {
   try {
     const raw = localStorage.getItem(LAST_KEY);
     if (!raw) return null;
-    const data = JSON.parse(raw) as { title?: string; cues?: Cue[]; names?: Record<string, string> };
+    const data = JSON.parse(raw) as {
+      title?: string;
+      cues?: Cue[];
+      names?: Record<string, string>;
+      id?: string | null;
+    };
     if (!data.cues?.length) return null;
-    return { title: data.title || "Transcripción", cues: data.cues, names: data.names ?? {} };
+    return {
+      title: data.title || "Transcripción",
+      cues: data.cues,
+      names: data.names ?? {},
+      id: data.id ?? null,
+    };
   } catch {
     return null;
   }
@@ -88,7 +109,8 @@ export function TranscribeDesk() {
   const [configured, setConfigured] = useState<boolean | null>(null);
   const [owner, setOwner] = useState(false);
   const [keyDraft, setKeyDraft] = useState("");
-  const [replacingKey, setReplacingKey] = useState(true);
+  const [replacingKey, setReplacingKey] = useState(false);
+  const [keyRejected, setKeyRejected] = useState(false);
   const [speakers, setSpeakers] = useState(0);
   const [terms, setTerms] = useState(DEFAULT_TERMS);
   const [file, setFile] = useState<File | null>(null);
@@ -138,6 +160,7 @@ export function TranscribeDesk() {
       setCues(saved.cues);
       setNames(saved.names);
       setTitle(saved.title);
+      setActiveId(saved.id);
       setPhase("done");
     }
     try {
@@ -316,7 +339,7 @@ export function TranscribeDesk() {
       });
       if (gate.cancelled) return;
 
-      rememberTranscript(file.name, result.cues, {});
+      rememberTranscript(file.name, result.cues, {}, null);
       setCues(result.cues);
       setNames({});
       setTitle(file.name);
@@ -328,6 +351,7 @@ export function TranscribeDesk() {
           data: { title: file.name, durationSec: duration, cues: result.cues },
         });
         setActiveId(saved.id);
+        rememberTranscript(file.name, result.cues, {}, saved.id);
         setJobs((prev) => [
           { id: saved.id, title: file.name, durationSec: duration, createdAt: new Date().toISOString() },
           ...prev.filter((job) => job.id !== saved.id),
@@ -344,7 +368,10 @@ export function TranscribeDesk() {
       setPhase("idle");
       setStatus("");
       const message = err instanceof Error ? err.message : "No se pudo transcribir.";
-      if (/clave/i.test(message)) setReplacingKey(true);
+      if (/clave|pase de transcripción/i.test(message)) {
+        setKeyRejected(true);
+        setReplacingKey(true);
+      }
       setError(message);
     }
   }
@@ -366,6 +393,7 @@ export function TranscribeDesk() {
     setNames(row.names);
     setActiveId(row.id);
     setTitle(row.title);
+    rememberTranscript(row.title, row.cues, row.names, row.id);
     setPhase("done");
     setFocusSpeaker(null);
     setStatus(row.title);
@@ -391,7 +419,13 @@ export function TranscribeDesk() {
       ];
       window.clearTimeout(editTimer.current);
       editTimer.current = window.setTimeout(() => {
-        rememberTranscript(title || "Transcripción", next, names);
+        rememberTranscript(title || "Transcripción", next, names, activeId);
+        if (!activeId) return;
+        void updateTranscriptCues({ data: { id: activeId, cues: next } })
+          .then(() => setStatus("Corrección guardada."))
+          .catch(() =>
+            setStatus("La corrección quedó en este navegador, pero no se pudo guardar en la sala."),
+          );
       }, 900);
       return next;
     });
@@ -433,6 +467,7 @@ export function TranscribeDesk() {
       setKeyDraft("");
       setConfigured(true);
       setReplacingKey(false);
+      setKeyRejected(false);
       setError("");
       setStatus("Clave guardada. El equipo no puede verla.");
     } catch (err) {
@@ -473,16 +508,19 @@ export function TranscribeDesk() {
     setStatus(`${item.name} se está guardando en Descargas.`);
   }
 
-  const showKeyForm = replacingKey || configured !== true;
+  const showKeyForm = owner && (configured === false || replacingKey);
+  const keyPrompt = keyRejected
+    ? "ElevenLabs rechazó la clave. Pega aquí una nueva."
+    : configured === false
+      ? "Pega la clave de ElevenLabs. Se registra una sola vez."
+      : "Pega la clave nueva de ElevenLabs.";
 
   return (
     <div className="mt-8 grid items-start gap-6 lg:grid-cols-[340px_1fr]">
       <section className="flex max-h-[calc(100vh-2rem)] flex-col gap-4 overflow-y-auto rounded-2xl border border-line bg-surface p-5 lg:sticky lg:top-4">
         {showKeyForm ? (
           <div className="flex flex-col gap-2 rounded-xl border border-primary bg-bg p-3">
-            <span className="text-sm font-medium text-ink">
-              ElevenLabs rechazó la clave. Pega aquí una nueva.
-            </span>
+            <span className="text-sm font-medium text-ink">{keyPrompt}</span>
             <input
               type="password"
               autoComplete="off"
@@ -497,17 +535,32 @@ export function TranscribeDesk() {
               disabled={keyDraft.trim().length < 16}
               className="h-11 rounded-xl bg-primary text-sm font-medium text-primary-fg disabled:opacity-40"
             >
-              Guardar clave nueva
+              Guardar clave
             </button>
+            {configured && (
+              <button
+                type="button"
+                onClick={() => {
+                  setReplacingKey(false);
+                  setKeyRejected(false);
+                  setKeyDraft("");
+                }}
+                className="h-11 rounded-xl border border-line text-sm"
+              >
+                Cancelar
+              </button>
+            )}
           </div>
-        ) : (
+        ) : owner && configured ? (
           <div className="flex items-center justify-between gap-3 text-sm">
             <span className="text-muted">Clave guardada.</span>
             <button type="button" onClick={() => setReplacingKey(true)} className="h-11 text-sm font-medium text-primary">
               Cambiar clave
             </button>
           </div>
-        )}
+        ) : configured === false ? (
+          <p className="text-sm text-muted">La clave la registra la cuenta del diario. Todavía no está lista.</p>
+        ) : null}
 
         <div className="grid grid-cols-2 gap-3">
           <label className="flex flex-col gap-2">
