@@ -88,7 +88,7 @@ export function TranscribeDesk() {
   const [configured, setConfigured] = useState<boolean | null>(null);
   const [owner, setOwner] = useState(false);
   const [keyDraft, setKeyDraft] = useState("");
-  const [replacingKey, setReplacingKey] = useState(false);
+  const [replacingKey, setReplacingKey] = useState(true);
   const [speakers, setSpeakers] = useState(0);
   const [terms, setTerms] = useState(DEFAULT_TERMS);
   const [file, setFile] = useState<File | null>(null);
@@ -343,7 +343,9 @@ export function TranscribeDesk() {
       if (gate.cancelled) return;
       setPhase("idle");
       setStatus("");
-      setError(err instanceof Error ? err.message : "No se pudo transcribir.");
+      const message = err instanceof Error ? err.message : "No se pudo transcribir.";
+      if (/clave/i.test(message)) setReplacingKey(true);
+      setError(message);
     }
   }
 
@@ -471,45 +473,41 @@ export function TranscribeDesk() {
     setStatus(`${item.name} se está guardando en Descargas.`);
   }
 
-  const showKeyForm = owner && (configured === false || replacingKey);
+  const showKeyForm = replacingKey || configured !== true;
 
   return (
     <div className="mt-8 grid items-start gap-6 lg:grid-cols-[340px_1fr]">
       <section className="flex max-h-[calc(100vh-2rem)] flex-col gap-4 overflow-y-auto rounded-2xl border border-line bg-surface p-5 lg:sticky lg:top-4">
-        <div className="rounded-xl bg-bg px-3 py-3 text-sm leading-relaxed text-muted">
-          Las voces se detectan solas. Un clic en una frase la resalta y la reproduce.
-        </div>
-
         {showKeyForm ? (
-          <div className="flex flex-col gap-2">
-            <span className="text-sm font-medium">Clave de ElevenLabs. Se registra una sola vez.</span>
+          <div className="flex flex-col gap-2 rounded-xl border border-primary bg-bg p-3">
+            <span className="text-sm font-medium text-ink">
+              ElevenLabs rechazó la clave. Pega aquí una nueva.
+            </span>
             <input
               type="password"
               autoComplete="off"
               value={keyDraft}
               onChange={(event) => setKeyDraft(event.target.value)}
-              placeholder="Pégala aquí. No se vuelve a mostrar."
-              className="h-11 rounded-xl border border-line bg-bg px-3 text-sm outline-none focus:border-primary"
+              placeholder="Pega la clave nueva. Empieza por sk_"
+              className="h-11 rounded-xl border border-line bg-surface px-3 text-sm outline-none focus:border-primary"
             />
             <button
               type="button"
               onClick={() => void storeKey()}
               disabled={keyDraft.trim().length < 16}
-              className="h-11 rounded-xl bg-ink text-sm font-medium text-bg disabled:opacity-40"
+              className="h-11 rounded-xl bg-primary text-sm font-medium text-primary-fg disabled:opacity-40"
             >
-              Guardar clave
+              Guardar clave nueva
             </button>
           </div>
-        ) : owner && configured ? (
+        ) : (
           <div className="flex items-center justify-between gap-3 text-sm">
-            <span className="text-muted">Clave guardada. No se vuelve a pedir.</span>
-            <button type="button" onClick={() => setReplacingKey(true)} className="h-11 text-sm text-primary">
-              Reemplazar
+            <span className="text-muted">Clave guardada.</span>
+            <button type="button" onClick={() => setReplacingKey(true)} className="h-11 text-sm font-medium text-primary">
+              Cambiar clave
             </button>
           </div>
-        ) : configured === false ? (
-          <p className="text-sm text-muted">La clave la registra el diario una sola vez. Todavía no está lista.</p>
-        ) : null}
+        )}
 
         <div className="grid grid-cols-2 gap-3">
           <label className="flex flex-col gap-2">
