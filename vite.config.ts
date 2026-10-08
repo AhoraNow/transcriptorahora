@@ -44,8 +44,8 @@ function pgliteBootstrapPlugin(): Plugin {
           await mod.ensureDbReady();
         }
       } catch (err) {
+        // A broken local database must not take the preview down. db.ts rebuilds it.
         console.error("[app-builder] DB bootstrap failed:", err);
-        throw err;
       }
     },
   };
@@ -150,6 +150,10 @@ export default defineConfig(({ command, isPreview }) => ({
     host: "0.0.0.0",
     port: 8080,
     strictPort: true,
+    watch: {
+      // Database writes must not reload the page. That was closing the room.
+      ignored: ["**/.data/**"],
+    },
   },
   preview: {
     host: "127.0.0.1",

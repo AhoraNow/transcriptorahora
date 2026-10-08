@@ -47,6 +47,23 @@ const BAR_HEX = ["#8f1d2c", "#1d4e63", "#8a5a12", "#2c5a3c", "#3d3a78", "#6d3b55
 const NAMES_KEY = "ahora-speaker-names";
 const LAST_KEY = "ahora-last-transcript";
 
+/** Índice del último elemento que ya empezó en `seconds`, o -1. Búsqueda binaria. */
+function lastStartedAt(items: { start: number }[], seconds: number): number {
+  let lo = 0;
+  let hi = items.length - 1;
+  let found = -1;
+  while (lo <= hi) {
+    const mid = (lo + hi) >> 1;
+    if (items[mid].start <= seconds + 0.05) {
+      found = mid;
+      lo = mid + 1;
+    } else {
+      hi = mid - 1;
+    }
+  }
+  return found;
+}
+
 function rememberTranscript(title: string, cues: Cue[], names: Record<string, string>) {
   try {
     localStorage.setItem(LAST_KEY, JSON.stringify({ title, cues, names }));
@@ -71,7 +88,7 @@ export function TranscribeDesk() {
   const [configured, setConfigured] = useState<boolean | null>(null);
   const [owner, setOwner] = useState(false);
   const [keyDraft, setKeyDraft] = useState("");
-  const [replacingKey, setReplacingKey] = useState(false);
+  const [replacingKey, setReplacingKey] = useState(true);
   const [speakers, setSpeakers] = useState(0);
   const [terms, setTerms] = useState(DEFAULT_TERMS);
   const [file, setFile] = useState<File | null>(null);
@@ -110,15 +127,7 @@ export function TranscribeDesk() {
     for (const cue of cues) if (!ids.includes(cue.speaker)) ids.push(cue.speaker);
     return ids;
   }, [cues]);
-  const activeIndex = useMemo(() => {
-    if (cues.length === 0) return -1;
-    let found = -1;
-    for (let i = 0; i < cues.length; i++) {
-      if (cues[i].start <= now + 0.05) found = i;
-      else break;
-    }
-    return found;
-  }, [cues, now]);
+  const hotTurn = useMemo(() => lastStartedAt(turns, now), [turns, now]);
 
   const busy = phase === "extracting" || phase === "sending";
   const estimate = costUsd(duration);
@@ -137,9 +146,11 @@ export function TranscribeDesk() {
     } catch {
       // El nombre se sigue pudiendo escribir aunque el navegador no lo recuerde.
     }
-    void loadAudio("current").then((blob) => {
-      if (blob) setPlayback(blob);
-    });
+    void loadAudio("current")
+      .then((blob) => {
+        if (blob) setPlayback(blob);
+      })
+      .catch(() => undefined);
   }, []);
 
   useEffect(() => {
@@ -150,36 +161,33 @@ export function TranscribeDesk() {
     const el = audioRef.current;
     if (!el) return;
     if (urlRef.current && el.getAttribute("src") !== urlRef.current) el.src = urlRef.current;
-    let frame = 0;
-    const tick = () => {
-      setNow(el.currentTime);
-      if (!el.paused) frame = requestAnimationFrame(tick);
-    };
-    const onPlay = () => {
-      setPlaying(true);
-      cancelAnimationFrame(frame);
-      frame = requestAnimationFrame(tick);
-    };
+    // timeupdate llega unas 4 veces por segundo: basta para marcar la frase.
+    // Antes cada timeupdate abría otro ciclo de requestAnimationFrame que nunca
+    // se cerraba; tras unos minutos de audio la página se congelaba.
+    const sync = () => setNow(el.currentTime);
+    const onPlay = () => setPlaying(true);
     const onPause = () => {
       setPlaying(false);
-      cancelAnimationFrame(frame);
-      setNow(el.currentTime);
+      sync();
     };
     el.addEventListener("play", onPlay);
     el.addEventListener("pause", onPause);
-    el.addEventListener("timeupdate", tick);
+    el.addEventListener("ended", onPause);
+    el.addEventListener("timeupdate", sync);
+    el.addEventListener("seeked", sync);
     return () => {
-      cancelAnimationFrame(frame);
       el.removeEventListener("play", onPlay);
       el.removeEventListener("pause", onPause);
-      el.removeEventListener("timeupdate", tick);
+      el.removeEventListener("ended", onPause);
+      el.removeEventListener("timeupdate", sync);
+      el.removeEventListener("seeked", sync);
     };
   }, [audioUrl]);
 
   useEffect(() => {
-    if (activeIndex < 0 || !playing) return;
-    document.getElementById(`cue-${activeIndex}`)?.scrollIntoView({ block: "nearest" });
-  }, [activeIndex, playing]);
+    if (hotTurn < 0 || !playing) return;
+    document.getElementById(`turn-${hotTurn}`)?.scrollIntoView({ block: "nearest" });
+  }, [hotTurn, playing]);
 
   function setPlayback(blob: Blob | null) {
     blobRef.current = blob;
@@ -227,7 +235,8 @@ export function TranscribeDesk() {
     setError("");
     setDuration(0);
     setPlayback(next);
-    if (next) void saveAudio("current", next);
+    // Un video grande puede no caber en el navegador: no debe romper la sala.
+    if (next) void saveAudio("current", next).catch(() => undefined);
     if (!next) return;
     setDuration(await readDuration(next));
   }
@@ -286,7 +295,7 @@ export function TranscribeDesk() {
     setCues([]);
     setNames({});
     setFocusSpeaker(null);
-    cancelRef.current = { cancelled: false };
+    cancelRef.current = { cancelled: false, abort: new AbortController() };
     const gate = cancelRef.current;
 
     try {
@@ -303,6 +312,7 @@ export function TranscribeDesk() {
           .map((term) => term.trim())
           .filter((term) => term.length >= 2 && term.length < 50)
           .slice(0, 40),
+        signal: gate.abort?.signal,
       });
       if (gate.cancelled) return;
 
@@ -333,14 +343,25 @@ export function TranscribeDesk() {
       if (gate.cancelled) return;
       setPhase("idle");
       setStatus("");
-      setError(err instanceof Error ? err.message : "No se pudo transcribir.");
+      const message = err instanceof Error ? err.message : "No se pudo transcribir.";
+      if (/clave/i.test(message)) setReplacingKey(true);
+      setError(message);
     }
   }
 
   async function openJob(job: Job) {
     setError("");
-    const row = await getTranscript({ data: job.id });
-    if (!row) return;
+    let row: Awaited<ReturnType<typeof getTranscript>>;
+    try {
+      row = await getTranscript({ data: job.id });
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "No se pudo abrir esa transcripción.");
+      return;
+    }
+    if (!row) {
+      setError("Esa transcripción ya no está en el historial.");
+      return;
+    }
     setCues(row.cues);
     setNames(row.names);
     setActiveId(row.id);
@@ -352,8 +373,8 @@ export function TranscribeDesk() {
 
   async function attachAudio(next: File | null) {
     if (!next || !activeId) return;
-    await saveAudio(activeId, next);
     setPlayback(next);
+    await saveAudio(activeId, next).catch(() => undefined);
     setStatus("Audio listo. Haz clic en una frase para oírla.");
   }
 
@@ -391,8 +412,13 @@ export function TranscribeDesk() {
   }
 
   async function removeJob(id: string) {
-    await deleteTranscript({ data: id });
-    await dropAudio(id);
+    try {
+      await deleteTranscript({ data: id });
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "No se pudo borrar.");
+      return;
+    }
+    await dropAudio(id).catch(() => undefined);
     setJobs((prev) => prev.filter((job) => job.id !== id));
     if (activeId === id) {
       setCues([]);
@@ -447,45 +473,41 @@ export function TranscribeDesk() {
     setStatus(`${item.name} se está guardando en Descargas.`);
   }
 
-  const showKeyForm = owner && (configured === false || replacingKey);
+  const showKeyForm = replacingKey || configured !== true;
 
   return (
     <div className="mt-8 grid items-start gap-6 lg:grid-cols-[340px_1fr]">
       <section className="flex max-h-[calc(100vh-2rem)] flex-col gap-4 overflow-y-auto rounded-2xl border border-line bg-surface p-5 lg:sticky lg:top-4">
-        <div className="rounded-xl bg-bg px-3 py-3 text-sm leading-relaxed text-muted">
-          Las voces se detectan solas. Un clic en una frase la resalta y la reproduce.
-        </div>
-
         {showKeyForm ? (
-          <div className="flex flex-col gap-2">
-            <span className="text-sm font-medium">Clave de ElevenLabs. Se registra una sola vez.</span>
+          <div className="flex flex-col gap-2 rounded-xl border border-primary bg-bg p-3">
+            <span className="text-sm font-medium text-ink">
+              ElevenLabs rechazó la clave. Pega aquí una nueva.
+            </span>
             <input
               type="password"
               autoComplete="off"
               value={keyDraft}
               onChange={(event) => setKeyDraft(event.target.value)}
-              placeholder="Pégala aquí. No se vuelve a mostrar."
-              className="h-11 rounded-xl border border-line bg-bg px-3 text-sm outline-none focus:border-primary"
+              placeholder="Pega la clave nueva. Empieza por sk_"
+              className="h-11 rounded-xl border border-line bg-surface px-3 text-sm outline-none focus:border-primary"
             />
             <button
               type="button"
               onClick={() => void storeKey()}
               disabled={keyDraft.trim().length < 16}
-              className="h-11 rounded-xl bg-ink text-sm font-medium text-bg disabled:opacity-40"
+              className="h-11 rounded-xl bg-primary text-sm font-medium text-primary-fg disabled:opacity-40"
             >
-              Guardar clave
+              Guardar clave nueva
             </button>
           </div>
-        ) : owner && configured ? (
+        ) : (
           <div className="flex items-center justify-between gap-3 text-sm">
-            <span className="text-muted">Clave guardada. No se vuelve a pedir.</span>
-            <button type="button" onClick={() => setReplacingKey(true)} className="h-11 text-sm text-primary">
-              Reemplazar
+            <span className="text-muted">Clave guardada.</span>
+            <button type="button" onClick={() => setReplacingKey(true)} className="h-11 text-sm font-medium text-primary">
+              Cambiar clave
             </button>
           </div>
-        ) : configured === false ? (
-          <p className="text-sm text-muted">La clave la registra el diario una sola vez. Todavía no está lista.</p>
-        ) : null}
+        )}
 
         <div className="grid grid-cols-2 gap-3">
           <label className="flex flex-col gap-2">
@@ -745,13 +767,14 @@ export function TranscribeDesk() {
           </div>
         ) : (
           <ol className="flex flex-col">
-            {turns.map((turn) => {
-              const hot = turn.cues.some((cue) => cues[activeIndex] === cue);
+            {turns.map((turn, turnIndex) => {
+              const hot = turnIndex === hotTurn;
               const dim = focusSpeaker !== null && focusSpeaker !== turn.speaker;
               const colorIndex = Math.max(0, speakerIds.indexOf(turn.speaker));
               return (
                 <li
                   key={`${turn.speaker}-${turn.start}`}
+                  id={`turn-${turnIndex}`}
                   className={`border-t border-l-4 border-line px-4 py-3 ${hot ? "bg-bg" : ""} ${dim ? "opacity-45" : ""}`}
                   style={{ borderLeftColor: BAR_HEX[colorIndex % BAR_HEX.length] }}
                 >
