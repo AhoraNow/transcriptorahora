@@ -47,6 +47,23 @@ const BAR_HEX = ["#8f1d2c", "#1d4e63", "#8a5a12", "#2c5a3c", "#3d3a78", "#6d3b55
 const NAMES_KEY = "ahora-speaker-names";
 const LAST_KEY = "ahora-last-transcript";
 
+/** Índice del último elemento que ya empezó en `seconds`, o -1. Búsqueda binaria. */
+function lastStartedAt(items: { start: number }[], seconds: number): number {
+  let lo = 0;
+  let hi = items.length - 1;
+  let found = -1;
+  while (lo <= hi) {
+    const mid = (lo + hi) >> 1;
+    if (items[mid].start <= seconds + 0.05) {
+      found = mid;
+      lo = mid + 1;
+    } else {
+      hi = mid - 1;
+    }
+  }
+  return found;
+}
+
 function rememberTranscript(title: string, cues: Cue[], names: Record<string, string>) {
   try {
     localStorage.setItem(LAST_KEY, JSON.stringify({ title, cues, names }));
@@ -110,15 +127,7 @@ export function TranscribeDesk() {
     for (const cue of cues) if (!ids.includes(cue.speaker)) ids.push(cue.speaker);
     return ids;
   }, [cues]);
-  const activeIndex = useMemo(() => {
-    if (cues.length === 0) return -1;
-    let found = -1;
-    for (let i = 0; i < cues.length; i++) {
-      if (cues[i].start <= now + 0.05) found = i;
-      else break;
-    }
-    return found;
-  }, [cues, now]);
+  const hotTurn = useMemo(() => lastStartedAt(turns, now), [turns, now]);
 
   const busy = phase === "extracting" || phase === "sending";
   const estimate = costUsd(duration);
@@ -137,9 +146,11 @@ export function TranscribeDesk() {
     } catch {
       // El nombre se sigue pudiendo escribir aunque el navegador no lo recuerde.
     }
-    void loadAudio("current").then((blob) => {
-      if (blob) setPlayback(blob);
-    });
+    void loadAudio("current")
+      .then((blob) => {
+        if (blob) setPlayback(blob);
+      })
+      .catch(() => undefined);
   }, []);
 
   useEffect(() => {
@@ -150,36 +161,33 @@ export function TranscribeDesk() {
     const el = audioRef.current;
     if (!el) return;
     if (urlRef.current && el.getAttribute("src") !== urlRef.current) el.src = urlRef.current;
-    let frame = 0;
-    const tick = () => {
-      setNow(el.currentTime);
-      if (!el.paused) frame = requestAnimationFrame(tick);
-    };
-    const onPlay = () => {
-      setPlaying(true);
-      cancelAnimationFrame(frame);
-      frame = requestAnimationFrame(tick);
-    };
+    // timeupdate llega unas 4 veces por segundo: basta para marcar la frase.
+    // Antes cada timeupdate abría otro ciclo de requestAnimationFrame que nunca
+    // se cerraba; tras unos minutos de audio la página se congelaba.
+    const sync = () => setNow(el.currentTime);
+    const onPlay = () => setPlaying(true);
     const onPause = () => {
       setPlaying(false);
-      cancelAnimationFrame(frame);
-      setNow(el.currentTime);
+      sync();
     };
     el.addEventListener("play", onPlay);
     el.addEventListener("pause", onPause);
-    el.addEventListener("timeupdate", tick);
+    el.addEventListener("ended", onPause);
+    el.addEventListener("timeupdate", sync);
+    el.addEventListener("seeked", sync);
     return () => {
-      cancelAnimationFrame(frame);
       el.removeEventListener("play", onPlay);
       el.removeEventListener("pause", onPause);
-      el.removeEventListener("timeupdate", tick);
+      el.removeEventListener("ended", onPause);
+      el.removeEventListener("timeupdate", sync);
+      el.removeEventListener("seeked", sync);
     };
   }, [audioUrl]);
 
   useEffect(() => {
-    if (activeIndex < 0 || !playing) return;
-    document.getElementById(`cue-${activeIndex}`)?.scrollIntoView({ block: "nearest" });
-  }, [activeIndex, playing]);
+    if (hotTurn < 0 || !playing) return;
+    document.getElementById(`turn-${hotTurn}`)?.scrollIntoView({ block: "nearest" });
+  }, [hotTurn, playing]);
 
   function setPlayback(blob: Blob | null) {
     blobRef.current = blob;
@@ -227,7 +235,8 @@ export function TranscribeDesk() {
     setError("");
     setDuration(0);
     setPlayback(next);
-    if (next) void saveAudio("current", next);
+    // Un video grande puede no caber en el navegador: no debe romper la sala.
+    if (next) void saveAudio("current", next).catch(() => undefined);
     if (!next) return;
     setDuration(await readDuration(next));
   }
@@ -286,7 +295,7 @@ export function TranscribeDesk() {
     setCues([]);
     setNames({});
     setFocusSpeaker(null);
-    cancelRef.current = { cancelled: false };
+    cancelRef.current = { cancelled: false, abort: new AbortController() };
     const gate = cancelRef.current;
 
     try {
@@ -303,6 +312,7 @@ export function TranscribeDesk() {
           .map((term) => term.trim())
           .filter((term) => term.length >= 2 && term.length < 50)
           .slice(0, 40),
+        signal: gate.abort?.signal,
       });
       if (gate.cancelled) return;
 
@@ -339,8 +349,17 @@ export function TranscribeDesk() {
 
   async function openJob(job: Job) {
     setError("");
-    const row = await getTranscript({ data: job.id });
-    if (!row) return;
+    let row: Awaited<ReturnType<typeof getTranscript>>;
+    try {
+      row = await getTranscript({ data: job.id });
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "No se pudo abrir esa transcripción.");
+      return;
+    }
+    if (!row) {
+      setError("Esa transcripción ya no está en el historial.");
+      return;
+    }
     setCues(row.cues);
     setNames(row.names);
     setActiveId(row.id);
@@ -352,8 +371,8 @@ export function TranscribeDesk() {
 
   async function attachAudio(next: File | null) {
     if (!next || !activeId) return;
-    await saveAudio(activeId, next);
     setPlayback(next);
+    await saveAudio(activeId, next).catch(() => undefined);
     setStatus("Audio listo. Haz clic en una frase para oírla.");
   }
 
@@ -391,8 +410,13 @@ export function TranscribeDesk() {
   }
 
   async function removeJob(id: string) {
-    await deleteTranscript({ data: id });
-    await dropAudio(id);
+    try {
+      await deleteTranscript({ data: id });
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "No se pudo borrar.");
+      return;
+    }
+    await dropAudio(id).catch(() => undefined);
     setJobs((prev) => prev.filter((job) => job.id !== id));
     if (activeId === id) {
       setCues([]);
@@ -745,13 +769,14 @@ export function TranscribeDesk() {
           </div>
         ) : (
           <ol className="flex flex-col">
-            {turns.map((turn) => {
-              const hot = turn.cues.some((cue) => cues[activeIndex] === cue);
+            {turns.map((turn, turnIndex) => {
+              const hot = turnIndex === hotTurn;
               const dim = focusSpeaker !== null && focusSpeaker !== turn.speaker;
               const colorIndex = Math.max(0, speakerIds.indexOf(turn.speaker));
               return (
                 <li
                   key={`${turn.speaker}-${turn.start}`}
+                  id={`turn-${turnIndex}`}
                   className={`border-t border-l-4 border-line px-4 py-3 ${hot ? "bg-bg" : ""} ${dim ? "opacity-45" : ""}`}
                   style={{ borderLeftColor: BAR_HEX[colorIndex % BAR_HEX.length] }}
                 >
