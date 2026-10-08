@@ -3,15 +3,15 @@ import { getSql } from "@/lib/db";
 import { authMiddleware } from "@/lib/auth/middleware";
 import { isOwnerEmail, normalizeEmail } from "@/lib/team";
 
-function requireOwner(context: { email: string; gateOwner: boolean }) {
-  if (context.gateOwner || isOwnerEmail(context.email)) return;
+function requireOwner(context: { owner: boolean }) {
+  if (context.owner) return;
   throw new Error("Solo la cuenta del diario puede cambiar el equipo.");
 }
 
 export const teamAccess = createServerFn({ method: "GET" })
   .middleware([authMiddleware])
   .handler(async ({ context }) => {
-    return { owner: context.gateOwner || isOwnerEmail(context.email) };
+    return { owner: context.owner };
   });
 
 export const listTeam = createServerFn({ method: "GET" })

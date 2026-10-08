@@ -2,7 +2,6 @@ import { createServerFn } from "@tanstack/react-start";
 import { getSql, rememberScribeKey } from "@/lib/db";
 import { authMiddleware } from "@/lib/auth/middleware";
 import type { Cue } from "@/lib/transcript";
-import { isOwnerEmail } from "@/lib/team";
 
 type CueRow = Cue;
 
@@ -24,7 +23,7 @@ export const saveKey = createServerFn({ method: "POST" })
     return trimmed;
   })
   .handler(async ({ context, data: key }) => {
-    if (!context.gateOwner && !isOwnerEmail(context.email)) {
+    if (!context.owner) {
       throw new Error("Solo la cuenta del diario puede cambiar la clave.");
     }
     const sql = await getSql();
